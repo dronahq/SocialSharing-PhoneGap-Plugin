@@ -1,11 +1,15 @@
 package nl.xservices.plugins;
 
+import nl.xservices.plugins.*;
+
 import android.annotation.SuppressLint;
+import android.app.PendingIntent;
 import android.app.Activity;
 import android.content.*;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
+import android.content.pm.LabeledIntent;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
@@ -13,6 +17,7 @@ import android.text.Html;
 import android.util.Base64;
 import android.view.Gravity;
 import android.widget.Toast;
+import android.util.Log;
 
 import org.apache.cordova.CallbackContext;
 import org.apache.cordova.CordovaInterface;
@@ -25,6 +30,7 @@ import org.json.JSONObject;
 import java.io.*;
 import java.net.URL;
 import java.net.URLConnection;
+import java.net.URLEncoder;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -81,13 +87,15 @@ public class SocialSharing extends CordovaPlugin {
     } else if (ACTION_SHARE_VIA_TWITTER_EVENT.equals(action)) {
       return doSendIntent(callbackContext, args.getString(0), args.getString(1), args.getJSONArray(2), args.getString(3), "twitter", null, false, true);
     } else if (ACTION_SHARE_VIA_FACEBOOK_EVENT.equals(action)) {
-      return doSendIntent(callbackContext, args.getString(0), args.getString(1), args.getJSONArray(2), args.getString(3), "com.facebook.katana", null, false, true);
+      return doSendIntent(callbackContext, args.getString(0), args.getString(1), args.isNull(3) ? args.getJSONArray(2) : null, args.getString(3), "com.facebook.katana", null, false, true, "com.facebook.composer.shareintent");
     } else if (ACTION_SHARE_VIA_FACEBOOK_WITH_PASTEMESSAGEHINT.equals(action)) {
       this.pasteMessage = args.getString(4);
-      return doSendIntent(callbackContext, args.getString(0), args.getString(1), args.getJSONArray(2), args.getString(3), "com.facebook.katana", null, false, true);
+      return doSendIntent(callbackContext, args.getString(0), args.getString(1), args.isNull(3) ? args.getJSONArray(2) : null, args.getString(3), "com.facebook.katana", null, false, true, "com.facebook.composer.shareintent");
     } else if (ACTION_SHARE_VIA_WHATSAPP_EVENT.equals(action)) {
-      if (notEmpty(args.getString(4))) {
+      if (notEmpty(args.getString(4))) { // abid
         return shareViaWhatsAppDirectly(callbackContext, args.getString(0), args.getString(1), args.getJSONArray(2), args.getString(3), args.getString(4));
+      } else if (notEmpty(args.getString(5))) { // phone
+        return shareViaWhatsAppDirectly(callbackContext, args.getString(0), args.getString(1), args.getJSONArray(2), args.getString(3), args.getString(5));
       } else {
         return doSendIntent(callbackContext, args.getString(0), args.getString(1), args.getJSONArray(2), args.getString(3), "whatsapp", null, false, true);
       }
@@ -128,7 +136,7 @@ public class SocialSharing extends CordovaPlugin {
     final SocialSharing plugin = this;
     cordova.getThreadPool().execute(new SocialSharingRunnable(callbackContext) {
       public void run() {
-        final Intent draft = new Intent(Intent.ACTION_SEND_MULTIPLE);
+        Intent draft = new Intent(Intent.ACTION_SENDTO);
         if (notEmpty(message)) {
           Pattern htmlPattern = Pattern.compile(".*\\<[^>]+>.*", Pattern.DOTALL);
           if (htmlPattern.matcher(message).matches()) {
@@ -157,7 +165,8 @@ public class SocialSharing extends CordovaPlugin {
             if (dir != null) {
               ArrayList<Uri> fileUris = new ArrayList<Uri>();
               for (int i = 0; i < files.length(); i++) {
-                final Uri fileUri = getFileUriAndSetType(draft, dir, files.getString(i), subject, i);
+                Uri fileUri = getFileUriAndSetType(draft, dir, files.getString(i), subject, i);
+                fileUri = FileProvider.getUriForFile(webView.getContext(), cordova.getActivity().getPackageName()+".sharing.provider", new File(fileUri.getPath()));
                 if (fileUri != null) {
                   fileUris.add(fileUri);
                 }
@@ -175,12 +184,25 @@ public class SocialSharing extends CordovaPlugin {
         // this was added to start the intent in a new window as suggested in #300 to prevent crashes upon return
         draft.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
 
-        draft.setType("application/octet-stream");
+        draft.setData(Uri.parse("mailto:"));
+
+        List<ResolveInfo> emailAppList = cordova.getActivity().getPackageManager().queryIntentActivities(draft, 0);
+
+        List<LabeledIntent> labeledIntentList = new ArrayList();
+        for (ResolveInfo info : emailAppList) {
+          draft.setAction(Intent.ACTION_SEND_MULTIPLE);
+          draft.setType("application/octet-stream");
+
+          draft.setComponent(new ComponentName(info.activityInfo.packageName, info.activityInfo.name));
+          labeledIntentList.add(new LabeledIntent(draft, info.activityInfo.packageName, info.loadLabel(cordova.getActivity().getPackageManager()), info.icon));
+        }
+        final Intent emailAppLists = Intent.createChooser(labeledIntentList.remove(labeledIntentList.size() - 1), "Choose Email App");
+        emailAppLists.putExtra(Intent.EXTRA_INITIAL_INTENTS, labeledIntentList.toArray(new LabeledIntent[labeledIntentList.size()]));
 
         // as an experiment for #300 we're explicitly running it on the ui thread here
         cordova.getActivity().runOnUiThread(new Runnable() {
           public void run() {
-            cordova.startActivityForResult(plugin, Intent.createChooser(draft, "Choose Email App"), ACTIVITY_CODE_SENDVIAEMAIL);
+            cordova.startActivityForResult(plugin, emailAppLists, ACTIVITY_CODE_SENDVIAEMAIL);
           }
         });
       }
@@ -208,7 +230,7 @@ public class SocialSharing extends CordovaPlugin {
         jsonObject.optString("subject", null),
         jsonObject.optJSONArray("files") == null ? new JSONArray() : jsonObject.optJSONArray("files"),
         jsonObject.optString("url", null),
-        null,
+        jsonObject.optString("appPackageName", null),
         jsonObject.optString("chooserTitle", null),
         false,
         false
@@ -225,6 +247,20 @@ public class SocialSharing extends CordovaPlugin {
       final String chooserTitle,
       final boolean peek,
       final boolean boolResult) {
+    return doSendIntent(callbackContext, msg, subject, files, url, appPackageName, chooserTitle, peek, boolResult, null);
+  }
+
+  private boolean doSendIntent(
+      final CallbackContext callbackContext,
+      final String msg,
+      final String subject,
+      final JSONArray files,
+      final String url,
+      final String appPackageName,
+      final String chooserTitle,
+      final boolean peek,
+      final boolean boolResult,
+      final String appName) {
 
     final CordovaInterface mycordova = cordova;
     final CordovaPlugin plugin = this;
@@ -234,6 +270,8 @@ public class SocialSharing extends CordovaPlugin {
         String message = msg;
         final boolean hasMultipleAttachments = files.length() > 1;
         final Intent sendIntent = new Intent(hasMultipleAttachments ? Intent.ACTION_SEND_MULTIPLE : Intent.ACTION_SEND);
+        final Intent receiverIntent = new Intent(cordova.getActivity().getApplicationContext(), ShareChooserPendingIntent.class);
+        final PendingIntent pendingIntent = PendingIntent.getBroadcast(cordova.getActivity().getApplicationContext(), 0, receiverIntent, PendingIntent.FLAG_UPDATE_CURRENT);
         sendIntent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_WHEN_TASK_RESET);
 
         try {
@@ -244,9 +282,8 @@ public class SocialSharing extends CordovaPlugin {
               Uri fileUri = null;
               for (int i = 0; i < files.length(); i++) {
                 fileUri = getFileUriAndSetType(sendIntent, dir, files.getString(i), subject, i);
-                if (fileUri != null) {
-                  fileUris.add(fileUri);
-                }
+                fileUri = FileProvider.getUriForFile(webView.getContext(), cordova.getActivity().getPackageName()+".sharing.provider", new File(fileUri.getPath()));
+                fileUris.add(fileUri);
               }
               if (!fileUris.isEmpty()) {
                 if (hasMultipleAttachments) {
@@ -296,7 +333,7 @@ public class SocialSharing extends CordovaPlugin {
             packageName = items[0];
             passedActivityName = items[1];
           }
-          final ActivityInfo activity = getActivity(callbackContext, sendIntent, packageName);
+          final ActivityInfo activity = getActivity(callbackContext, sendIntent, packageName, appName);
           if (activity != null) {
             if (peek) {
               callbackContext.sendPluginResult(new PluginResult(PluginResult.Status.OK));
@@ -335,7 +372,14 @@ public class SocialSharing extends CordovaPlugin {
             // as an experiment for #300 we're explicitly running it on the ui thread here
             cordova.getActivity().runOnUiThread(new Runnable() {
               public void run() {
-                mycordova.startActivityForResult(plugin, Intent.createChooser(sendIntent, chooserTitle), boolResult ? ACTIVITY_CODE_SEND__BOOLRESULT : ACTIVITY_CODE_SEND__OBJECT);
+                Intent chooseIntent;
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP_MR1) {
+                  // Intent.createChooser's third param was only added in SDK version 22.
+                  chooseIntent = Intent.createChooser(sendIntent, chooserTitle, pendingIntent.getIntentSender());
+                } else {
+                  chooseIntent = Intent.createChooser(sendIntent, chooserTitle);
+                }
+                mycordova.startActivityForResult(plugin, chooseIntent, boolResult ? ACTIVITY_CODE_SEND__BOOLRESULT : ACTIVITY_CODE_SEND__OBJECT);
               }
             });
           }
@@ -370,13 +414,15 @@ public class SocialSharing extends CordovaPlugin {
     String localImage = image;
     if (image.endsWith("mp4") || image.endsWith("mov") || image.endsWith("3gp")){
       sendIntent.setType("video/*");
+    } else if (image.endsWith("mp3")) {
+      sendIntent.setType("audio/x-mpeg");
     } else {
       sendIntent.setType("image/*");
     }
 
     if (image.startsWith("http") || image.startsWith("www/")) {
       String filename = getFileName(image);
-      localImage = "file://" + dir + "/" + filename;
+      localImage = "file://" + dir + "/" + filename.replaceAll("[^a-zA-Z0-9._-]", "");
       if (image.startsWith("http")) {
         // filename optimisation taken from https://github.com/EddyVerbruggen/SocialSharing-PhoneGap-Plugin/pull/56
         URLConnection connection = new URL(image).openConnection();
@@ -433,7 +479,7 @@ public class SocialSharing extends CordovaPlugin {
       final String encodedImg = image.substring(image.indexOf(";base64,") + 8);
       sendIntent.setType(fileType);
       saveFile(Base64.decode(encodedImg, Base64.DEFAULT), dir, sanitizeFilename(fileName));
-      localImage = "file://" + dir + "/" + fileName;
+      localImage = "file://" + dir + "/" + sanitizeFilename(fileName);
     } else if (!image.startsWith("file://")) {
       throw new IllegalArgumentException("URL_NOT_SUPPORTED");
     } else {
@@ -526,6 +572,7 @@ public class SocialSharing extends CordovaPlugin {
     MIME_Map.put("",       "*/*");
   }
 
+  // sending files is not supported with ACTION_VIEW, and with ACTION_SEND the message doesn't get prefilled :(
   private boolean shareViaWhatsAppDirectly(final CallbackContext callbackContext, String message, final String subject, final JSONArray files, final String url, final String number) {
     // add the URL to the message, as there seems to be no separate field
     if (notEmpty(url)) {
@@ -539,39 +586,9 @@ public class SocialSharing extends CordovaPlugin {
     final SocialSharing plugin = this;
     cordova.getThreadPool().execute(new SocialSharingRunnable(callbackContext) {
       public void run() {
-        final Intent intent = new Intent(Intent.ACTION_SENDTO);
-        intent.setData(Uri.parse("smsto:" + number));
-
-        intent.putExtra("sms_body", shareMessage);
-        intent.putExtra("sms_subject", subject);
-        intent.setPackage("com.whatsapp");
-
+        final Intent intent = new Intent(Intent.ACTION_VIEW);
         try {
-          if (files.length() > 0 && !"".equals(files.getString(0))) {
-            final boolean hasMultipleAttachments = files.length() > 1;
-            final String dir = getDownloadDir();
-            if (dir != null) {
-              ArrayList<Uri> fileUris = new ArrayList<Uri>();
-              Uri fileUri = null;
-              for (int i = 0; i < files.length(); i++) {
-                fileUri = getFileUriAndSetType(intent, dir, files.getString(i), subject, i);
-                if (fileUri != null) {
-                  fileUris.add(fileUri);
-                }
-              }
-              if (!fileUris.isEmpty()) {
-                if (hasMultipleAttachments) {
-                  intent.putExtra(Intent.EXTRA_STREAM, fileUris);
-                } else {
-                  intent.putExtra(Intent.EXTRA_STREAM, fileUri);
-                }
-              }
-            }
-          }
-        } catch (Exception e) {
-          callbackContext.error(e.getMessage());
-        }
-        try {
+          intent.setData(Uri.parse("https://api.whatsapp.com/send?phone=" + number + "&text=" + URLEncoder.encode(shareMessage, "UTF-8")));
           // this was added to start the intent in a new window as suggested in #300 to prevent crashes upon return
           // update: didn't help (doesn't seem to hurt either though)
           intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
@@ -579,7 +596,11 @@ public class SocialSharing extends CordovaPlugin {
           // as an experiment for #300 we're explicitly running it on the ui thread here
           cordova.getActivity().runOnUiThread(new Runnable() {
             public void run() {
-              cordova.startActivityForResult(plugin, intent, ACTIVITY_CODE_SENDVIAWHATSAPP);
+              try {
+                cordova.startActivityForResult(plugin, intent, ACTIVITY_CODE_SENDVIAWHATSAPP);
+              } catch (Exception e) {
+                callbackContext.error(e.getMessage());
+              }
             }
           });
         } catch (Exception e) {
@@ -650,12 +671,14 @@ public class SocialSharing extends CordovaPlugin {
     return null;
   }
 
-  private ActivityInfo getActivity(final CallbackContext callbackContext, final Intent shareIntent, final String appPackageName) {
+  private ActivityInfo getActivity(final CallbackContext callbackContext, final Intent shareIntent, final String appPackageName, final String appName) {
     final PackageManager pm = webView.getContext().getPackageManager();
     List<ResolveInfo> activityList = pm.queryIntentActivities(shareIntent, 0);
     for (final ResolveInfo app : activityList) {
       if ((app.activityInfo.packageName).contains(appPackageName)) {
-        return app.activityInfo;
+        if (appName == null || (app.activityInfo.name).contains(appName)) {
+          return app.activityInfo;
+        }
       }
     }
     // no matching app found
@@ -685,7 +708,7 @@ public class SocialSharing extends CordovaPlugin {
           JSONObject json = new JSONObject();
           try {
             json.put("completed", resultCode == Activity.RESULT_OK);
-            json.put("app", ""); // we need a completely different approach if we want to support this on Android. Idea: https://clickclickclack.wordpress.com/2012/01/03/intercepting-androids-action_send-intents/
+            json.put("app", (ShareChooserPendingIntent.chosenComponent != null ? ShareChooserPendingIntent.chosenComponent : "")); // we need a completely different approach if we want to support this on Android. Idea: https://clickclickclack.wordpress.com/2012/01/03/intercepting-androids-action_send-intents/
             _callbackContext.sendPluginResult(new PluginResult(
                 PluginResult.Status.OK,
                 json));
